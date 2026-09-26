@@ -7,6 +7,7 @@ from typing import Any
 SUPPORTED_LANGUAGES = {'python', 'java', 'cpp', 'javascript', 'c'}
 SUPPORTED_DIFFICULTIES = {'easy', 'medium', 'hard'}
 SUPPORTED_TYPES = {'coding', 'debugging', 'knowledge', 'ast'}
+STUDENT_QUESTION_FIELDS = ('id', 'concept_key', 'slug', 'title', 'description', 'prompt', 'version', 'language', 'difficulty', 'question_type', 'constraints_text', 'examples', 'published', 'active')
 
 
 def slugify(value: str) -> str:
@@ -74,3 +75,11 @@ def matches_filters(row: dict[str, Any], *, search: str = '', role: str = '', la
     if role and role not in roles: return False
     if skill and skill not in skills: return False
     return True
+
+
+def student_safe_question(row: dict[str, Any]) -> dict[str, Any]:
+    """Return only fields required to render an assigned assessment question."""
+    safe = {key: deepcopy(row[key]) for key in STUDENT_QUESTION_FIELDS if key in row}
+    safe['question_skills'] = [{'skill_name': item['skill_name']} for item in row.get('question_skills', []) if 'skill_name' in item]
+    safe['question_languages'] = [{'language': item['language'], 'starter_code': item.get('starter_code', '')} for item in row.get('question_languages', []) if 'language' in item]
+    return safe

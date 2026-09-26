@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from packages.deterministic_engine.engine import score_results
-from services.api.app.question_bank import build_version_payload, next_version, validate_question_input
+from services.api.app.question_bank import build_version_payload, next_version, student_safe_question, validate_question_input
 
 class Settings(BaseSettings):
     supabase_url: str = os.getenv('SUPABASE_URL','')
@@ -86,7 +86,12 @@ async def assessment_detail(assessment_id:str,user=Depends(current_user)):
         if not allowed: raise HTTPException(403,'Assessment not assigned')
     elif user['role']=='tpo' and a['author_id'] != user['id']:
         raise HTTPException(403,'Assessment is outside your authorized cohort')
-    qs=await repo.query('assessment_questions', {'assessment_id':f'eq.{assessment_id}','select':'*,questions(*)','order':'position.asc'})
+    question_select = 'assessment_id,question_id,position,points,question_snapshot,questions(id,concept_key,slug,title,description,prompt,version,language,difficulty,question_type,constraints_text,examples,published,active,question_skills(skill_name),question_languages(language,starter_code))' if user['role']=='student' else '*,questions(*)'
+    qs=await repo.query('assessment_questions', {'assessment_id':f'eq.{assessment_id}','select':question_select,'order':'position.asc'})
+    if user['role']=='student':
+        qs=[{**item, 'questions': student_safe_question(item.get('questions') or {})} for item in qs]
+    if user['role']=='student':
+        a={key:a[key] for key in ('id','title','description','target_role','allowed_languages','duration_minutes','status') if key in a}
     a['questions']=qs; return a
 
 @app.post('/api/tpo/assessments', status_code=201)

@@ -136,3 +136,53 @@ async def get_submission(submission_id:str,user=Depends(current_user)):
 async def dashboard(user=Depends(require('tpo','admin'))):
     assessments=await repo.query('assessments', {'author_id':f'eq.{user["id"]}','select':'id,title,status'}) if user['role']=='tpo' else await repo.query('assessments', {'select':'id,title,status'})
     return {'assessments':assessments,'note':'All displayed metrics reconcile to persisted submissions; ML readiness is non-authoritative.'}
+
+
+@app.post('/api/tpo/questions', status_code=201)
+async def create_question(body: dict[str, Any], user=Depends(require('tpo','admin'))):
+    required = ('concept_key','title','prompt','language','difficulty','question_type')
+    missing = [key for key in required if not body.get(key)]
+    if missing: raise HTTPException(422, f'Missing fields: {", ".join(missing)}')
+    payload = {key: body[key] for key in ('concept_key','version','title','prompt','constraints_text','examples','seed_parameters','hidden_tests','scoring_rules','runtime_image','language','difficulty','question_type') if key in body}
+    payload.update({'created_by': user['id'], 'published': False})
+    question = (await repo.query('questions', payload=payload, method='POST'))[0]
+    for table, values in (('question_roles', body.get('roles', [])), ('question_skills', body.get('skills', []))):
+        if values:
+            key = 'role_name' if table == 'question_roles' else 'skill_name'
+            await repo.query(table, payload=[{'question_id': question['id'], key: value} for value in values], method='POST')
+    await repo.query('audit_logs', payload={'actor_id': user['id'], 'action':'question.created', 'entity_type':'question', 'entity_id':question['id']}, method='POST')
+    return question
+
+@app.get('/api/tpo/questions')
+async def question_bank(user=Depends(require('tpo','admin'))):
+    return await repo.query('questions', {'select':'*,question_roles(*),question_skills(*)','order':'created_at.desc'})
+
+@app.post('/api/tpo/assessments/{assessment_id}/assign')
+async def assign_assessment(assessment_id: str, body: dict[str, Any], user=Depends(require('tpo','admin'))):
+    student_ids = body.get('student_ids', [])
+    if not student_ids or not isinstance(student_ids, list): raise HTTPException(422, 'student_ids must be a non-empty list')
+    assignments = [{'assessment_id': assessment_id, 'student_id': student_id, 'assigned_by': user['id']} for student_id in student_ids]
+    return await repo.query('assessment_assignments', payload=assignments, method='POST')
+
+@app.get('/api/ast/challenges')
+async def ast_challenges(user=Depends(require('student','tpo','admin'))):
+    return await repo.query('ast_challenges', {'active':'eq.true','select':'id,title,language,skill_name'})
+
+@app.post('/api/ast/challenges/{challenge_id}/attempt', status_code=201)
+async def ast_attempt(challenge_id: str, body: dict[str, Any], user=Depends(require('student'))):
+    challenge = await repo.query('ast_challenges', {'id':f'eq.{challenge_id}','active':'eq.true','select':'*','limit':'1'})
+    if not challenge: raise HTTPException(404, 'AST challenge not found')
+    patch = body.get('patch', '')
+    rules = challenge[0].get('patch_rules') or {}
+    passed = all(required in patch for required in rules.get('required_replacements', []))
+    return (await repo.query('ast_attempts', payload={'challenge_id':challenge_id,'student_id':user['id'],'patch':patch,'passed':passed,'score':100 if passed else 0}, method='POST'))[0]
+
+@app.get('/api/readiness')
+async def readiness(user=Depends(require('student','tpo','admin'))):
+    params = {'select':'*','order':'inferred_at.desc'}
+    if user['role'] == 'student': params['student_id'] = f'eq.{user["id"]}'
+    return await repo.query('student_readiness', params)
+
+@app.get('/api/admin/audit')
+async def audit(user=Depends(require('admin'))):
+    return await repo.query('audit_logs', {'select':'*','order':'created_at.desc','limit':'200'})

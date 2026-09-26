@@ -34,12 +34,15 @@ select u.id, coalesce(u.raw_user_meta_data->>'full_name',''), coalesce(u.email,'
 from auth.users u left join public.profiles p on p.auth_user_id = u.id where p.id is null;
 
 create table public.questions (
- id uuid primary key default gen_random_uuid(), concept_key text not null, version integer not null default 1, title text not null, prompt text not null,
+ id uuid primary key default gen_random_uuid(), concept_key text not null, slug text not null, version integer not null default 1, title text not null, description text not null default '', prompt text not null,
  constraints_text text, examples jsonb not null default '[]', seed_parameters jsonb not null default '{}', hidden_tests jsonb not null default '[]',
  scoring_rules jsonb not null default '{"max_score":100}', runtime_image text not null default 'python:3.12-slim', language text not null,
- difficulty public.difficulty_level not null, question_type public.question_type not null, published boolean not null default false,
- created_by uuid not null references public.profiles(id), created_at timestamptz not null default now(), unique(concept_key,version)
+ difficulty public.difficulty_level not null, question_type public.question_type not null, published boolean not null default false, active boolean not null default true,
+ created_by uuid not null references public.profiles(id), created_at timestamptz not null default now(), updated_at timestamptz not null default now(), unique(concept_key,version), unique(slug,version)
 );
+create index questions_filter_idx on public.questions(active,published,difficulty,question_type,language);
+create index questions_concept_version_idx on public.questions(concept_key,version desc);
+create trigger questions_updated_at before update on public.questions for each row execute function public.set_updated_at();
 create table public.question_roles(question_id uuid references public.questions(id) on delete cascade, role_name text not null, primary key(question_id,role_name));
 create table public.question_skills(question_id uuid references public.questions(id) on delete cascade, skill_name text not null, weight numeric not null default 1, primary key(question_id,skill_name));
 create table public.question_languages(question_id uuid references public.questions(id) on delete cascade, language text not null, starter_code text not null default '', primary key(question_id,language));

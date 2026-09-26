@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import Editor from '@monaco-editor/react';
 import { createClient } from '@supabase/supabase-js';
+import QuestionBank from './QuestionBank';
 
 const supabaseUrl = (process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://build-placeholder.supabase.co').replace(/\/rest\/v1\/?$/, '');
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'build-placeholder-anon-key';
@@ -117,7 +118,7 @@ export default function Home() {
         <Editor height="48vh" theme="vs-dark" defaultLanguage="python" value={code} onChange={value => setCode(value || '')} options={{ minimap: { enabled: false }, fontSize: 14, roundedSelection: false }} />
         <div className="editor-actions"><span>{message}</span><button onClick={submit} disabled={busy || remaining === 0}>{busy ? 'Submitting…' : 'Submit solution'}</button></div>
       </section>
-    </section> : <>
+    </section> : user.role !== 'student' ? <QuestionBank request={request} /> : <>
       <section className="hero"><div><span className="status-dot" /> {user.role === 'student' ? 'Your assigned assessments' : 'Workspace overview'}<h2>Build signal.<br /><em>Not noise.</em></h2></div><p>Every assessment is versioned, time-bound, and scored by reproducible tests. AI insights never determine your authoritative result.</p></section>
       <section className="section-head"><h2>{user.role === 'student' ? 'Assigned assessments' : 'Assessments'}</h2><span>{assessments.length} active</span></section>
       <section className="cards">{assessments.map(assessment => <article className="card" key={assessment.id}><div className="card-top"><span className="pill">{assessment.target_role}</span><span className="muted">{assessment.duration_minutes} min</span></div><h3>{assessment.title}</h3><p>{assessment.description || 'Role-aligned assessment with deterministic evaluation.'}</p><div className="card-foot"><span>{assessment.status}</span><button onClick={() => start(assessment)}>Open assessment →</button></div></article>)}{!assessments.length && <div className="empty">No assessments assigned yet.</div>}</section>

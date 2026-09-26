@@ -4,13 +4,14 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Any
 import httpx
-from fastapi import FastAPI, Depends, HTTPException, Header, status
+from fastapi import FastAPI, Depends, HTTPException, Header, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from jose import jwt, JWTError
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from packages.deterministic_engine.engine import score_results
+from services.api.app.question_bank import build_version_payload, next_version, validate_question_input
 
 class Settings(BaseSettings):
     supabase_url: str = os.getenv('SUPABASE_URL','')
@@ -154,24 +155,31 @@ async def dashboard(user=Depends(require('tpo','admin'))):
 
 @app.post('/api/tpo/questions', status_code=201)
 async def create_question(body: dict[str, Any], user=Depends(require('tpo','admin'))):
-    required = ('concept_key','title','prompt','language','difficulty','question_type')
-    missing = [key for key in required if not body.get(key)]
-    if missing: raise HTTPException(422, f'Missing fields: {", ".join(missing)}')
-    payload = {key: body[key] for key in ('concept_key','version','title','prompt','constraints_text','examples','seed_parameters','hidden_tests','scoring_rules','runtime_image','language','difficulty','question_type') if key in body}
+    try: normalized = validate_question_input(body)
+    except ValueError as error: raise HTTPException(422, str(error))
+    payload = {key: normalized[key] for key in ('concept_key','slug','version','title','description','prompt','constraints_text','examples','seed_parameters','hidden_tests','scoring_rules','runtime_image','language','difficulty','question_type','active') if key in normalized}
     payload.update({'created_by': user['id'], 'published': False})
     question = (await repo.query('questions', payload=payload, method='POST'))[0]
-    for table, values in (('question_roles', body.get('roles', [])), ('question_skills', body.get('skills', []))):
+    for table, values in (('question_roles', normalized.get('roles', [])), ('question_skills', normalized.get('skills', []))):
         if values:
             key = 'role_name' if table == 'question_roles' else 'skill_name'
             await repo.query(table, payload=[{'question_id': question['id'], key: value} for value in values], method='POST')
+    variants = normalized.get('language_variants', [])
+    if variants:
+        await repo.query('question_languages', payload=[{'question_id':question['id'],'language':v['language'],'starter_code':v.get('starter_code','')} for v in variants], method='POST')
     await repo.query('audit_logs', payload={'actor_id': user['id'], 'action':'question.created', 'entity_type':'question', 'entity_id':question['id']}, method='POST')
     return question
 
 @app.get('/api/tpo/questions')
-async def question_bank(user=Depends(require('tpo','admin'))):
-    params={'select':'*,question_roles(*),question_skills(*)','order':'created_at.desc'}
+async def question_bank(user=Depends(require('tpo','admin')), search: str = '', role: str = '', language: str = '', skill: str = '', difficulty: str = '', question_type: str = '', active: str = '', page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)):
+    params={'select':'*,question_roles(*),question_skills(*),question_languages(*)','order':'created_at.desc'}
     if user['role']=='tpo': params['created_by']=f'eq.{user["id"]}'
-    return await repo.query('questions', params)
+    rows=await repo.query('questions', params)
+    filtered=[row for row in rows if all((not value or row.get(key)==value) for key,value in (('language',language),('difficulty',difficulty),('question_type',question_type))) and (not search or search.lower() in f"{row.get('title','')} {row.get('description','')} {row.get('concept_key','')}".lower()) and (not active or str(row.get('active',True)).lower()==active)]
+    if role: filtered=[row for row in filtered if role in {x.get('role_name') for x in row.get('question_roles',[])}]
+    if skill: filtered=[row for row in filtered if skill in {x.get('skill_name') for x in row.get('question_skills',[])}]
+    start=(page-1)*page_size
+    return {'items':filtered[start:start+page_size],'page':page,'page_size':page_size,'total':len(filtered)}
 
 @app.post('/api/tpo/assessments/{assessment_id}/assign')
 async def assign_assessment(assessment_id: str, body: dict[str, Any], user=Depends(require('tpo','admin'))):
@@ -214,3 +222,63 @@ async def assign_role(profile_id: str, body: dict[str, Any], user=Depends(requir
     if not updated: raise HTTPException(404,'Profile not found')
     await repo.query('audit_logs', payload={'actor_id':user['id'],'action':'profile.role_changed','entity_type':'profile','entity_id':profile_id,'metadata':{'role':role}}, method='POST')
     return updated[0]
+
+
+async def _owned_question(question_id: str, user: dict[str, Any]) -> dict[str, Any]:
+    rows=await repo.query('questions', {'id':f'eq.{question_id}','select':'*,question_roles(*),question_skills(*),question_languages(*)','limit':'1'})
+    if not rows: raise HTTPException(404,'Question not found')
+    if user['role']=='tpo' and rows[0]['created_by'] != user['id']: raise HTTPException(403,'Question is outside your authorized scope')
+    return rows[0]
+
+@app.patch('/api/tpo/questions/{question_id}')
+async def edit_draft_question(question_id: str, body: dict[str, Any], user=Depends(require('tpo','admin'))):
+    current=await _owned_question(question_id,user)
+    if current['published']: raise HTTPException(409,'Published question versions are immutable; create a new version')
+    try: normalized=validate_question_input(body, partial=True)
+    except ValueError as error: raise HTTPException(422,str(error))
+    allowed=('slug','title','description','prompt','constraints_text','examples','seed_parameters','hidden_tests','scoring_rules','runtime_image','language','difficulty','question_type','active')
+    payload={key:normalized[key] for key in allowed if key in normalized}
+    updated=(await repo.query('questions', {'id':f'eq.{question_id}'}, 'PATCH', payload))[0]
+    for table,key,values in (('question_roles','role_name',normalized.get('roles')),('question_skills','skill_name',normalized.get('skills'))):
+        if values is not None:
+            await repo.query(table, {'question_id':f'eq.{question_id}'}, 'DELETE')
+            if values: await repo.query(table, payload=[{'question_id':question_id,key:value} for value in values], method='POST')
+    return updated
+
+@app.post('/api/tpo/questions/{question_id}/version', status_code=201)
+async def create_question_version(question_id: str, body: dict[str, Any], user=Depends(require('tpo','admin'))):
+    current=await _owned_question(question_id,user)
+    history=await repo.query('questions', {'concept_key':f'eq.{current["concept_key"]}','select':'version'})
+    try: normalized=validate_question_input(body, partial=True)
+    except ValueError as error: raise HTTPException(422,str(error))
+    overrides={key:normalized[key] for key in ('slug','title','description','prompt','constraints_text','examples','seed_parameters','hidden_tests','scoring_rules','runtime_image','language','difficulty','question_type') if key in normalized}
+    payload=build_version_payload(current,overrides,next_version(history),user['id'])
+    created=(await repo.query('questions',payload=payload,method='POST'))[0]
+    roles=normalized.get('roles', [x['role_name'] for x in current.get('question_roles',[])])
+    skills=normalized.get('skills', [x['skill_name'] for x in current.get('question_skills',[])])
+    if roles: await repo.query('question_roles',payload=[{'question_id':created['id'],'role_name':value} for value in roles],method='POST')
+    if skills: await repo.query('question_skills',payload=[{'question_id':created['id'],'skill_name':value} for value in skills],method='POST')
+    variants=normalized.get('language_variants', [{'language':x['language'],'starter_code':x.get('starter_code','')} for x in current.get('question_languages',[])])
+    if variants: await repo.query('question_languages',payload=[{'question_id':created['id'],'language':v['language'],'starter_code':v.get('starter_code','')} for v in variants],method='POST')
+    await repo.query('audit_logs',payload={'actor_id':user['id'],'action':'question.version_created','entity_type':'question','entity_id':created['id'],'metadata':{'source_question_id':question_id,'version':created['version']}},method='POST')
+    return created
+
+@app.post('/api/tpo/questions/{question_id}/variants')
+async def add_language_variant(question_id: str, body: dict[str, Any], user=Depends(require('tpo','admin'))):
+    current=await _owned_question(question_id,user)
+    if current['published']: raise HTTPException(409,'Published question versions are immutable; create a new version')
+    language=body.get('language','').lower()
+    if language not in {'python','java','cpp','javascript','c'}: raise HTTPException(422,'Unsupported language')
+    return (await repo.query('question_languages',payload={'question_id':question_id,'language':language,'starter_code':body.get('starter_code','')},method='POST'))[0]
+
+@app.post('/api/tpo/questions/{question_id}/status')
+async def set_question_status(question_id: str, body: dict[str, Any], user=Depends(require('tpo','admin'))):
+    current=await _owned_question(question_id,user)
+    if current['published']: raise HTTPException(409,'Published question versions are immutable; create a new version')
+    if not isinstance(body.get('active'), bool): raise HTTPException(422,'active must be boolean')
+    return (await repo.query('questions', {'id':f'eq.{question_id}'}, 'PATCH', {'active':body['active']}))[0]
+
+@app.get('/api/tpo/questions/{question_id}/history')
+async def question_history(question_id: str, user=Depends(require('tpo','admin'))):
+    current=await _owned_question(question_id,user)
+    return await repo.query('questions', {'concept_key':f'eq.{current["concept_key"]}','select':'id,concept_key,slug,title,version,published,active,language,difficulty,question_type,created_at,updated_at','order':'version.desc'})

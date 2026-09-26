@@ -19,8 +19,12 @@ class Settings(BaseSettings):
     cors_origins: str = os.getenv('CORS_ORIGINS','http://localhost:3000')
 settings=Settings()
 
+def supabase_root() -> str:
+    value = settings.supabase_url.rstrip('/')
+    return value[:-len('/rest/v1')] if value.endswith('/rest/v1') else value
+
 class Repo:
-    def __init__(self): self.base=settings.supabase_url.rstrip('/')+'/rest/v1'; self.headers={'apikey':settings.supabase_service_role_key,'Authorization':'Bearer '+settings.supabase_service_role_key,'Content-Type':'application/json','Prefer':'return=representation'}
+    def __init__(self): self.base=supabase_root()+'/rest/v1'; self.headers={'apikey':settings.supabase_service_role_key,'Authorization':'Bearer '+settings.supabase_service_role_key,'Content-Type':'application/json','Prefer':'return=representation'}
     async def query(self, table:str, params:dict[str,str]|None=None, method='GET', payload:Any=None):
         async with httpx.AsyncClient(timeout=20) as c:
             r=await c.request(method, f'{self.base}/{table}', params=params, headers=self.headers, json=payload)
@@ -35,7 +39,7 @@ async def current_user(authorization: str|None=Header(default=None)):
     except JWTError: raise HTTPException(401,'Invalid session')
     if not user_id: raise HTTPException(401,'Invalid session')
     async with httpx.AsyncClient(timeout=10) as c:
-        r=await c.get(settings.supabase_url.rstrip('/')+'/auth/v1/user', headers={'apikey':settings.supabase_anon_key,'Authorization':'Bearer '+token})
+        r=await c.get(supabase_root()+'/auth/v1/user', headers={'apikey':settings.supabase_anon_key,'Authorization':'Bearer '+token})
     if r.status_code != 200: raise HTTPException(401,'Session expired')
     rows=await repo.query('profiles', {'auth_user_id':f'eq.{user_id}','select':'*','limit':'1'})
     if not rows: raise HTTPException(403,'Profile is not provisioned')

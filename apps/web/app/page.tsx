@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import Editor from '@monaco-editor/react';
 import { createClient } from '@supabase/supabase-js';
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://build-placeholder.supabase.co';
+const supabaseUrl = (process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://build-placeholder.supabase.co').replace(/\/rest\/v1\/?$/, '');
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'build-placeholder-anon-key';
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 const api = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000';

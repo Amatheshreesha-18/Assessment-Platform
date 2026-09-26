@@ -15,7 +15,7 @@ from packages.deterministic_engine.engine import score_results
 class Settings(BaseSettings):
     supabase_url: str = os.getenv('SUPABASE_URL','')
     supabase_anon_key: str = os.getenv('SUPABASE_ANON_KEY', os.getenv('SUPABASE_KEY',''))
-    supabase_service_role_key: str = os.getenv('SUPABASE_SERVICE_ROLE_KEY', os.getenv('SUPABASE_KEY',''))
+    supabase_service_role_key: str = os.getenv('SUPABASE_SERVICE_ROLE_KEY','')
     cors_origins: str = os.getenv('CORS_ORIGINS','http://localhost:3000')
 settings=Settings()
 
@@ -68,7 +68,8 @@ async def me(user=Depends(current_user)): return user
 
 @app.get('/api/assessments')
 async def list_assessments(user=Depends(current_user)):
-    if user['role'] in ('tpo','admin'): return await repo.query('assessments', {'select':'*','order':'created_at.desc'})
+    if user['role'] == 'admin': return await repo.query('assessments', {'select':'*','order':'created_at.desc'})
+    if user['role'] == 'tpo': return await repo.query('assessments', {'author_id':f'eq.{user["id"]}','select':'*','order':'created_at.desc'})
     assignments=await repo.query('assessment_assignments', {'student_id':f'eq.{user["id"]}','select':'assessment_id'})
     ids=','.join(x['assessment_id'] for x in assignments)
     if not ids: return []
@@ -82,6 +83,8 @@ async def assessment_detail(assessment_id:str,user=Depends(current_user)):
     if user['role']=='student':
         allowed=await repo.query('assessment_assignments', {'assessment_id':f'eq.{assessment_id}','student_id':f'eq.{user["id"]}','limit':'1'})
         if not allowed: raise HTTPException(403,'Assessment not assigned')
+    elif user['role']=='tpo' and a['author_id'] != user['id']:
+        raise HTTPException(403,'Assessment is outside your authorized cohort')
     qs=await repo.query('assessment_questions', {'assessment_id':f'eq.{assessment_id}','select':'*,questions(*)','order':'position.asc'})
     a['questions']=qs; return a
 
@@ -96,6 +99,9 @@ async def create_assessment(body:AssessmentCreate,user=Depends(require('tpo','ad
 
 @app.post('/api/tpo/assessments/{assessment_id}/publish')
 async def publish(assessment_id:str,user=Depends(require('tpo','admin'))):
+    assessment=await repo.query('assessments', {'id':f'eq.{assessment_id}','select':'id,author_id,status','limit':'1'})
+    if not assessment: raise HTTPException(404,'Assessment not found')
+    if user['role']=='tpo' and assessment[0]['author_id'] != user['id']: raise HTTPException(403,'Assessment is outside your authorized cohort')
     rows=await repo.query('assessment_questions', {'assessment_id':f'eq.{assessment_id}','select':'question_id'})
     if not rows: raise HTTPException(400,'Assessment needs at least one question')
     updated=(await repo.query('assessments', {'id':f'eq.{assessment_id}'},'PATCH',{'status':'published','published_at':datetime.now(timezone.utc).isoformat()}))
@@ -134,6 +140,10 @@ async def submit(body:SubmissionCreate,user=Depends(require('student'))):
 async def get_submission(submission_id:str,user=Depends(current_user)):
     rows=await repo.query('submissions', {'id':f'eq.{submission_id}','select':'*','limit':'1'})
     if not rows or (user['role']=='student' and rows[0]['student_id']!=user['id']): raise HTTPException(404,'Submission not found')
+    if user['role']=='tpo':
+        attempt=await repo.query('attempts', {'id':f'eq.{rows[0]["attempt_id"]}','select':'assessment_id','limit':'1'})
+        authorized=await repo.query('assessments', {'id':f'eq.{attempt[0]["assessment_id"]}','author_id':f'eq.{user["id"]}','select':'id','limit':'1'}) if attempt else []
+        if not authorized: raise HTTPException(403,'Submission is outside your authorized cohort')
     return rows[0]
 
 @app.get('/api/tpo/dashboard')
@@ -159,10 +169,15 @@ async def create_question(body: dict[str, Any], user=Depends(require('tpo','admi
 
 @app.get('/api/tpo/questions')
 async def question_bank(user=Depends(require('tpo','admin'))):
-    return await repo.query('questions', {'select':'*,question_roles(*),question_skills(*)','order':'created_at.desc'})
+    params={'select':'*,question_roles(*),question_skills(*)','order':'created_at.desc'}
+    if user['role']=='tpo': params['created_by']=f'eq.{user["id"]}'
+    return await repo.query('questions', params)
 
 @app.post('/api/tpo/assessments/{assessment_id}/assign')
 async def assign_assessment(assessment_id: str, body: dict[str, Any], user=Depends(require('tpo','admin'))):
+    assessment=await repo.query('assessments', {'id':f'eq.{assessment_id}','select':'id,author_id','limit':'1'})
+    if not assessment: raise HTTPException(404,'Assessment not found')
+    if user['role']=='tpo' and assessment[0]['author_id'] != user['id']: raise HTTPException(403,'Assessment is outside your authorized cohort')
     student_ids = body.get('student_ids', [])
     if not student_ids or not isinstance(student_ids, list): raise HTTPException(422, 'student_ids must be a non-empty list')
     assignments = [{'assessment_id': assessment_id, 'student_id': student_id, 'assigned_by': user['id']} for student_id in student_ids]
@@ -190,3 +205,12 @@ async def readiness(user=Depends(require('student','tpo','admin'))):
 @app.get('/api/admin/audit')
 async def audit(user=Depends(require('admin'))):
     return await repo.query('audit_logs', {'select':'*','order':'created_at.desc','limit':'200'})
+
+@app.patch('/api/admin/profiles/{profile_id}/role')
+async def assign_role(profile_id: str, body: dict[str, Any], user=Depends(require('admin'))):
+    role=body.get('role')
+    if role not in ('student','tpo','admin'): raise HTTPException(422,'role must be student, tpo, or admin')
+    updated=await repo.query('profiles', {'id':f'eq.{profile_id}'}, 'PATCH', {'role':role})
+    if not updated: raise HTTPException(404,'Profile not found')
+    await repo.query('audit_logs', payload={'actor_id':user['id'],'action':'profile.role_changed','entity_type':'profile','entity_id':profile_id,'metadata':{'role':role}}, method='POST')
+    return updated[0]

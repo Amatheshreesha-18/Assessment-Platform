@@ -14,10 +14,24 @@ create table public.profiles (
  full_name text not null default '', email text not null, role public.app_role not null default 'student', college_id uuid, department text,
  active boolean not null default true, created_at timestamptz not null default now(), updated_at timestamptz not null default now()
 );
-create index profiles_auth_user_idx on public.profiles(auth_user_id);
 
 create or replace function public.current_profile_id() returns uuid language sql stable security definer set search_path = public as $$ select id from public.profiles where auth_user_id = auth.uid() and active = true limit 1 $$;
 create or replace function public.current_role() returns public.app_role language sql stable security definer set search_path = public as $$ select role from public.profiles where auth_user_id = auth.uid() and active = true limit 1 $$;
+create or replace function public.set_updated_at() returns trigger language plpgsql as $$ begin new.updated_at = now(); return new; end $$;
+create or replace function public.handle_new_auth_user() returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  insert into public.profiles(auth_user_id, full_name, email)
+  values (new.id, coalesce(new.raw_user_meta_data->>'full_name',''), coalesce(new.email,''))
+  on conflict (auth_user_id) do update set email = excluded.email, updated_at = now();
+  return new;
+end $$;
+create trigger on_auth_user_created after insert on auth.users for each row execute function public.handle_new_auth_user();
+create trigger profiles_updated_at before update on public.profiles for each row execute function public.set_updated_at();
+
+-- Backfill profiles for Auth users that existed before this migration was installed.
+insert into public.profiles(auth_user_id, full_name, email)
+select u.id, coalesce(u.raw_user_meta_data->>'full_name',''), coalesce(u.email,'')
+from auth.users u left join public.profiles p on p.auth_user_id = u.id where p.id is null;
 
 create table public.questions (
  id uuid primary key default gen_random_uuid(), concept_key text not null, version integer not null default 1, title text not null, prompt text not null,
@@ -35,27 +49,44 @@ create table public.assessments (
  duration_minutes integer not null check(duration_minutes between 5 and 480), attempt_policy jsonb not null default '{"max_attempts":1}', skill_distribution jsonb not null default '{}', difficulty_distribution jsonb not null default '{}',
  status public.assessment_status not null default 'draft', author_id uuid not null references public.profiles(id), published_at timestamptz, created_at timestamptz not null default now(), updated_at timestamptz not null default now()
 );
-create index assessments_author_status_idx on public.assessments(author_id,status);
+create trigger assessments_updated_at before update on public.assessments for each row execute function public.set_updated_at();
 create table public.assessment_questions(assessment_id uuid references public.assessments(id) on delete cascade, question_id uuid references public.questions(id), position integer not null, points numeric not null default 100, question_snapshot jsonb, primary key(assessment_id,question_id), unique(assessment_id,position));
 create table public.assessment_assignments(id uuid primary key default gen_random_uuid(), assessment_id uuid not null references public.assessments(id) on delete cascade, student_id uuid not null references public.profiles(id) on delete cascade, assigned_by uuid not null references public.profiles(id), created_at timestamptz not null default now(), unique(assessment_id,student_id));
 
 create table public.attempts(id uuid primary key default gen_random_uuid(), assessment_id uuid not null references public.assessments(id), student_id uuid not null references public.profiles(id), started_at timestamptz not null default now(), deadline_at timestamptz not null, submitted_at timestamptz, status text not null default 'active', unique(assessment_id,student_id));
-create index attempts_student_idx on public.attempts(student_id,status);
 create table public.submissions(id uuid primary key default gen_random_uuid(), attempt_id uuid not null references public.attempts(id) on delete cascade, question_id uuid not null references public.questions(id), student_id uuid not null references public.profiles(id), language text not null, source_code text not null, status public.submission_status not null default 'queued', score numeric, feedback jsonb, submitted_at timestamptz not null default now(), completed_at timestamptz);
-create index submissions_attempt_idx on public.submissions(attempt_id,status);
 create table public.execution_logs(id uuid primary key default gen_random_uuid(), submission_id uuid not null references public.submissions(id) on delete cascade, runtime_image text not null, seed jsonb not null, normalized_result jsonb, stdout text, stderr text, exit_code integer, timed_out boolean not null default false, network_disabled boolean not null default true, resource_limits jsonb not null default '{"cpus":1,"memory_mb":256}', started_at timestamptz not null default now(), finished_at timestamptz);
 create table public.integrity_events(id uuid primary key default gen_random_uuid(), attempt_id uuid not null references public.attempts(id) on delete cascade, student_id uuid not null references public.profiles(id), event_type text not null, metadata jsonb not null default '{}', occurred_at timestamptz not null default now());
 create table public.ast_challenges(id uuid primary key default gen_random_uuid(), title text not null, language text not null, buggy_source text not null, patch_rules jsonb not null, skill_name text not null, active boolean not null default true);
 create table public.ast_attempts(id uuid primary key default gen_random_uuid(), challenge_id uuid not null references public.ast_challenges(id), student_id uuid not null references public.profiles(id), patch text not null, passed boolean not null, score numeric not null default 0, created_at timestamptz not null default now());
 create table public.student_readiness(id uuid primary key default gen_random_uuid(), student_id uuid not null references public.profiles(id), readiness_score numeric check(readiness_score between 0 and 100), model_version text not null, feature_snapshot jsonb not null, inferred_at timestamptz not null default now());
-create index readiness_student_idx on public.student_readiness(student_id,inferred_at desc);
 create table public.audit_logs(id uuid primary key default gen_random_uuid(), actor_id uuid references public.profiles(id), action text not null, entity_type text not null, entity_id uuid, metadata jsonb not null default '{}', created_at timestamptz not null default now());
+
+create index profiles_auth_user_idx on public.profiles(auth_user_id);
+create index assessments_author_status_idx on public.assessments(author_id,status);
+create index assessments_status_created_idx on public.assessments(status,created_at desc);
+create index assessment_questions_question_idx on public.assessment_questions(question_id);
+create index assignments_student_idx on public.assessment_assignments(student_id,created_at desc);
+create index assignments_assessment_idx on public.assessment_assignments(assessment_id);
+create index attempts_student_status_idx on public.attempts(student_id,status);
+create index attempts_assessment_status_idx on public.attempts(assessment_id,status);
+create index submissions_student_status_idx on public.submissions(student_id,status);
+create index submissions_attempt_idx on public.submissions(attempt_id,status);
+create index submissions_question_idx on public.submissions(question_id);
+create index execution_logs_submission_idx on public.execution_logs(submission_id,started_at desc);
+create index integrity_events_attempt_idx on public.integrity_events(attempt_id,occurred_at desc);
+create index integrity_events_student_idx on public.integrity_events(student_id,occurred_at desc);
+create index ast_attempts_student_idx on public.ast_attempts(student_id,created_at desc);
+create index readiness_student_idx on public.student_readiness(student_id,inferred_at desc);
+create index audit_logs_actor_idx on public.audit_logs(actor_id,created_at desc);
+create index audit_logs_entity_idx on public.audit_logs(entity_type,entity_id,created_at desc);
 
 create or replace function public.prevent_published_question_mutation() returns trigger language plpgsql as $$ begin if old.published then raise exception 'Published question versions are immutable'; end if; return new; end $$;
 create trigger immutable_published_questions before update or delete on public.questions for each row execute function public.prevent_published_question_mutation();
 create or replace function public.prevent_published_assessment_mutation() returns trigger language plpgsql as $$ begin if old.status = 'published' and (new.status <> 'archived' or new.title <> old.title or new.duration_minutes <> old.duration_minutes or new.allowed_languages <> old.allowed_languages) then raise exception 'Published assessments are immutable'; end if; return new; end $$;
 create trigger immutable_published_assessments before update on public.assessments for each row execute function public.prevent_published_assessment_mutation();
 
+alter table public.roles enable row level security;
 alter table public.profiles enable row level security;
 alter table public.assessments enable row level security;
 alter table public.assessment_questions enable row level security;
@@ -66,22 +97,31 @@ alter table public.question_skills enable row level security;
 alter table public.question_languages enable row level security;
 alter table public.attempts enable row level security;
 alter table public.submissions enable row level security;
+alter table public.execution_logs enable row level security;
 alter table public.integrity_events enable row level security;
 alter table public.ast_challenges enable row level security;
 alter table public.ast_attempts enable row level security;
 alter table public.student_readiness enable row level security;
 alter table public.audit_logs enable row level security;
 
-create policy profiles_self on public.profiles for select using(auth_user_id=auth.uid() or public.current_role() in ('tpo','admin'));
+create policy roles_authenticated_read on public.roles for select using(auth.uid() is not null);
+create policy profiles_self_or_authorized on public.profiles for select using(
+ auth_user_id=auth.uid() or public.current_role()='admin' or
+ (public.current_role()='tpo' and exists(select 1 from public.assessment_assignments aa join public.assessments a on a.id=aa.assessment_id where a.author_id=public.current_profile_id() and aa.student_id=profiles.id))
+);
 create policy profiles_admin_write on public.profiles for all using(public.current_role()='admin') with check(public.current_role()='admin');
-create policy assessment_permitted on public.assessments for select using(author_id=public.current_profile_id() or status='published' and exists(select 1 from public.assessment_assignments a where a.assessment_id=id and a.student_id=public.current_profile_id()) or public.current_role()='admin');
-create policy assessment_tpo_write on public.assessments for all using(public.current_role() in ('tpo','admin')) with check(author_id=public.current_profile_id() or public.current_role()='admin');
+create policy assessment_permitted on public.assessments for select using(author_id=public.current_profile_id() or (status='published' and exists(select 1 from public.assessment_assignments a where a.assessment_id=id and a.student_id=public.current_profile_id())) or public.current_role()='admin');
+create policy assessment_tpo_write on public.assessments for all using(public.current_role() in ('tpo','admin') and (author_id=public.current_profile_id() or public.current_role()='admin')) with check(public.current_role() in ('tpo','admin') and (author_id=public.current_profile_id() or public.current_role()='admin'));
 create policy assessment_question_permitted on public.assessment_questions for select using(exists(select 1 from public.assessments a where a.id=assessment_id and (a.author_id=public.current_profile_id() or exists(select 1 from public.assessment_assignments x where x.assessment_id=a.id and x.student_id=public.current_profile_id()) or public.current_role()='admin')));
 create policy assignments_permitted on public.assessment_assignments for select using(student_id=public.current_profile_id() or assigned_by=public.current_profile_id() or public.current_role()='admin');
-create policy questions_tpo_admin on public.questions for all using(public.current_role() in ('tpo','admin')) with check(public.current_role() in ('tpo','admin'));
+create policy questions_tpo_admin on public.questions for all using(public.current_role() in ('tpo','admin') and (created_by=public.current_profile_id() or public.current_role()='admin')) with check(public.current_role() in ('tpo','admin') and (created_by=public.current_profile_id() or public.current_role()='admin'));
 create policy questions_student_published on public.questions for select using(published=true);
-create policy attempts_self on public.attempts for all using(student_id=public.current_profile_id() or public.current_role() in ('tpo','admin')) with check(student_id=public.current_profile_id() or public.current_role() in ('tpo','admin'));
-create policy submissions_self on public.submissions for all using(student_id=public.current_profile_id() or public.current_role() in ('tpo','admin')) with check(student_id=public.current_profile_id() or public.current_role() in ('tpo','admin'));
+create policy question_roles_read on public.question_roles for select using(exists(select 1 from public.questions q where q.id=question_id and (q.published=true or q.created_by=public.current_profile_id() or public.current_role()='admin')));
+create policy question_skills_read on public.question_skills for select using(exists(select 1 from public.questions q where q.id=question_id and (q.published=true or q.created_by=public.current_profile_id() or public.current_role()='admin')));
+create policy question_languages_read on public.question_languages for select using(exists(select 1 from public.questions q where q.id=question_id and (q.published=true or q.created_by=public.current_profile_id() or public.current_role()='admin')));
+create policy attempts_authorized_read on public.attempts for select using(student_id=public.current_profile_id() or public.current_role() in ('tpo','admin'));
+create policy submissions_authorized_read on public.submissions for select using(student_id=public.current_profile_id() or public.current_role() in ('tpo','admin'));
+create policy execution_logs_authorized_read on public.execution_logs for select using(public.current_role()='admin' or exists(select 1 from public.submissions s join public.attempts a on a.id=s.attempt_id where s.id=submission_id and (s.student_id=public.current_profile_id() or exists(select 1 from public.assessments x where x.id=a.assessment_id and x.author_id=public.current_profile_id()))));
 create policy integrity_self_insert on public.integrity_events for insert with check(student_id=public.current_profile_id());
 create policy integrity_authorized_read on public.integrity_events for select using(student_id=public.current_profile_id() or public.current_role() in ('tpo','admin'));
 create policy ast_challenges_read on public.ast_challenges for select using(active=true or public.current_role() in ('tpo','admin'));

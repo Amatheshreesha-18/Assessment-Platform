@@ -1,0 +1,5 @@
+-- Run after 001_v1_core.sql. Question ownership must reference a provisioned TPO/admin profile.
+-- This seed intentionally contains metadata only; no credentials or test users are inserted.
+-- Example:
+-- insert into public.ast_challenges(title,language,buggy_source,patch_rules,skill_name)
+-- values ('Off-by-one loop','python','for i in range(n + 1): ...','{"required_replacements":["range(n)"]}','DSA');
